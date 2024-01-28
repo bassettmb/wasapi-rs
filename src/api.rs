@@ -6,7 +6,7 @@ use std::{error, fmt, ptr, slice};
 use widestring::U16CString;
 use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::{
-    core::PCSTR,
+    core::{GUID, PCSTR},
     Win32::Devices::FunctionDiscovery::{
         PKEY_DeviceInterface_FriendlyName, PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName,
     },
@@ -14,8 +14,8 @@ use windows::{
     Win32::Media::Audio::{
         eCapture, eCommunications, eConsole, eMultimedia, eRender, AudioSessionStateActive,
         AudioSessionStateExpired, AudioSessionStateInactive, IAudioCaptureClient, IAudioClient,
-        IAudioClock, IAudioRenderClient, IAudioSessionControl, IAudioSessionEvents, IMMDevice,
-        IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
+        IAudioClock, IAudioRenderClient, IAudioSessionControl, IAudioSessionEvents,
+        IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
         AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
         AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -734,6 +734,12 @@ impl AudioClient {
         Ok(AudioSessionControl { control })
     }
 
+    /// Get the [SimpleAudioVolume]
+    pub fn get_simpleaudiovolume(&self) -> WasapiRes<SimpleAudioVolume> {
+        let volume = unsafe { self.client.GetService::<ISimpleAudioVolume>()? };
+        Ok(SimpleAudioVolume { volume })
+    }
+
     /// Get the [AudioClock]
     pub fn get_audioclock(&self) -> WasapiRes<AudioClock> {
         let clock = unsafe { self.client.GetService::<IAudioClock>()? };
@@ -787,6 +793,45 @@ impl AudioSessionControl {
         }
     }
 }
+
+/// Struct wrapping an [ISimpleAudioVolume](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-isimpleaudiovolume)
+pub struct SimpleAudioVolume {
+    volume: ISimpleAudioVolume,
+}
+
+impl SimpleAudioVolume {
+    fn ptr_from_ref<T>(r: Option<&T>) -> *const T {
+        match r {
+            None => ptr::null(),
+            Some(r) => r
+        }
+    }
+
+    /// Get the level of the master volume.
+    pub fn get_master_volume(&self) -> WasapiRes<f32> {
+        let master_volume = unsafe { self.volume.GetMasterVolume()? };
+        Ok(master_volume)
+    }
+
+    /// Get the current mute state.
+    pub fn get_mute(&self) -> WasapiRes<bool> {
+        let mute = unsafe { self.volume.GetMute()? };
+        Ok(bool::from(mute))
+    }
+
+    /// Set the level of the master volume.
+    pub fn set_master_volume(&self, level: f32, event_context: Option<&GUID>) -> WasapiRes<()> {
+        unsafe { self.volume.SetMasterVolume(level, Self::ptr_from_ref(event_context))? };
+        Ok(())
+    }
+
+    /// Set the current mute state.
+    pub fn set_mute(&self, mute: bool, event_context: Option<&GUID>) -> WasapiRes<()> {
+        unsafe { self.volume.SetMute(mute, Self::ptr_from_ref(event_context))? };
+        Ok(())
+    }
+}
+
 
 /// Struct wrapping an [IAudioClock](https://docs.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudioclock).
 pub struct AudioClock {
