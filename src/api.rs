@@ -20,9 +20,11 @@ use windows::{
         AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE,
-        DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT, DEVICE_STATE_UNPLUGGED, WAVEFORMATEX,
-        WAVEFORMATEXTENSIBLE,
+        DEVICE_STATE_DISABLED, DEVICE_STATE_NOTPRESENT, DEVICE_STATE_UNPLUGGED,
+        ENDPOINT_HARDWARE_SUPPORT_VOLUME, ENDPOINT_HARDWARE_SUPPORT_MUTE,
+        ENDPOINT_HARDWARE_SUPPORT_METER, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
     },
+    Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback},
     Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
     Win32::System::Com::StructuredStorage::PropVariantToStringAlloc,
     Win32::System::Com::STGM_READ,
@@ -33,7 +35,10 @@ use windows::{
     Win32::System::Threading::{CreateEventA, WaitForSingleObject},
 };
 
-use crate::{make_channelmasks, AudioSessionEvents, EventCallbacks, WaveFormat};
+use crate::{
+    make_channelmasks, AudioSessionEvents, AudioEndpointVolumeCallback,
+    AudioVolumeNotificationCallback, EventCallbacks, WaveFormat
+};
 
 pub(crate) type WasapiRes<T> = Result<T, Box<dyn error::Error>>;
 
@@ -340,6 +345,11 @@ impl Device {
             direction: self.direction,
             sharemode: None,
         })
+    }
+
+    pub fn get_iaudioendpointvolume(&self) -> WasapiRes<AudioEndpointVolume> {
+        let volume = unsafe { self.device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)? };
+        Ok(AudioEndpointVolume { volume })
     }
 
     /// Read state from an [IMMDevice]
@@ -832,6 +842,214 @@ impl SimpleAudioVolume {
     }
 }
 
+/// Struct wrapping a [IAudioEndpointVolume](https://learn.microsoft.com/en-us/windows/win32/api/endpointvolume/nn-endpointvolume-iaudioendpointvolume).
+pub struct AudioEndpointVolume {
+    volume: IAudioEndpointVolume
+}
+
+/// Struct containing a [volume range](https://learn.microsoft.com/en-us/windows/win32/api/endpointvolume/nf-endpointvolume-iaudioendpointvolume-getvolumerange).
+#[derive(Clone, Debug)]
+pub struct EndpointVolumeRange {
+    /// Minimum supported level in decibels.
+    pub min_db: f32,
+    /// Maximum supported level in decibels.
+    pub max_db: f32,
+    /// Change in level with each volume step.
+    pub increment_db: f32,
+}
+
+/// Struct containing [volume step info](https://learn.microsoft.com/en-us/windows/win32/api/endpointvolume/nf-endpointvolume-iaudioendpointvolume-getvolumestepinfo).
+#[derive(Clone, Debug)]
+pub struct EndpointVolumeStepInfo {
+    /// Current volume step index.
+    pub step: u32,
+    /// Number of steps in the volume range.
+    pub step_count: u32,
+}
+
+/// Struct containing [supported hardware capabilities](https://learn.microsoft.com/en-us/windows/win32/api/endpointvolume/nf-endpointvolume-iaudioendpointvolume-queryhardwaresupport).
+#[derive(Clone, Debug)]
+pub struct EndpointCapabilities {
+    /// Endpoint supports a hardware volume control.
+    pub volume: bool,
+    /// Endpoint supports a hardware mute control.
+    pub mute: bool,
+    /// Endpoint supports a hardware peak meter.
+    pub meter: bool,
+}
+
+impl AudioEndpointVolume {
+    fn ptr_from_ref<T>(r: Option<&T>) -> *const T {
+        match r {
+            None => ptr::null(),
+            Some(r) => r
+        }
+    }
+    /// Get the channel count of the stream associated with the endpoint.
+    pub fn get_channel_count(&self) -> WasapiRes<u32> {
+        let channel_count = unsafe { self.volume.GetChannelCount()? };
+        Ok(channel_count)
+    }
+
+    /// Get the volume level in decibels of the specified channel of the stream associated with the endpoint.
+    pub fn get_channel_volume_level(&self, nchannel: u32) -> WasapiRes<f32> {
+        let level = unsafe { self.volume.GetChannelVolumeLevel(nchannel)? };
+        Ok(level)
+    }
+
+    /// Get the normalized, audio-tapered volume level of the specified channel of the stream associated with the endpoint.
+    pub fn get_channel_volume_level_scalar(&self, nchannel: u32) -> WasapiRes<f32> {
+        let level = unsafe { self.volume.GetChannelVolumeLevel(nchannel)? };
+        Ok(level)
+    }
+
+    /// Get the master volume level in decibels of the stream associated with the endpoint.
+    pub fn get_master_volume_level(&self) -> WasapiRes<f32> {
+        let level = unsafe { self.volume.GetMasterVolumeLevel()? };
+        Ok(level)
+    }
+
+    /// Get the normalized, audio-tapered master volume level of the stream associated with the endpoint.
+    pub fn get_master_volume_level_scalar(&self) -> WasapiRes<f32> {
+        let level = unsafe { self.volume.GetMasterVolumeLevelScalar()? };
+        Ok(level)
+    }
+
+    /// Get the mute state of the stream associated with the endpoint.
+    pub fn get_mute(&self) -> WasapiRes<bool> {
+        let mute = unsafe { self.volume.GetMute()? };
+        Ok(bool::from(mute))
+    }
+
+    /// Get the volume range in decibels of the stream associated with the endpoint.
+    pub fn get_volume_range(&self) -> WasapiRes<EndpointVolumeRange> {
+        let mut min_db = 0f32;
+        let mut max_db = 0f32;
+        let mut increment_db = 0f32;
+        unsafe {
+            self.volume.GetVolumeRange(&mut min_db, &mut max_db, &mut increment_db)?
+        };
+        Ok(EndpointVolumeRange { min_db, max_db, increment_db })
+    }
+
+    /// Get information about the current step in the volume range.
+    pub fn get_volume_step_info(&self) -> WasapiRes<EndpointVolumeStepInfo> {
+        let mut step = 0u32;
+        let mut step_count = 0u32;
+        unsafe { self.volume.GetVolumeStepInfo(&mut step, &mut step_count)? };
+        Ok(EndpointVolumeStepInfo { step, step_count })
+    }
+
+    /// Query the audio endpoint for its hardware-supported capabilities.
+    pub fn query_hardware_support(&self) -> WasapiRes<EndpointCapabilities> {
+        let capabilities = unsafe { self.volume.QueryHardwareSupport()? };
+        Ok(EndpointCapabilities {
+            volume: capabilities & ENDPOINT_HARDWARE_SUPPORT_VOLUME != 0,
+            mute: capabilities & ENDPOINT_HARDWARE_SUPPORT_MUTE != 0,
+            meter: capabilities & ENDPOINT_HARDWARE_SUPPORT_METER != 0
+        })
+    }
+
+    /// Set the volume level in decibels of the specified channel of the stream associated with the endpoint.
+    pub fn set_channel_volume_level(
+        &self,
+        nchannel: u32,
+        level_db: f32,
+        event_context: Option<&GUID>
+    ) -> WasapiRes<()> {
+        unsafe {
+            self.volume.SetChannelVolumeLevel(
+                nchannel,
+                level_db,
+                Self::ptr_from_ref(event_context)
+            )?
+        };
+        Ok(())
+    }
+
+    /// Set the normalized, audio-tapered volume level of the specified channel of the stream associated with the endpoint.
+    pub fn set_channel_volume_level_scalar(
+        &self,
+        nchannel: u32,
+        level: f32,
+        event_context: Option<&GUID>
+    ) -> WasapiRes<()> {
+        unsafe {
+            self.volume.SetChannelVolumeLevel(
+                nchannel,
+                level,
+                Self::ptr_from_ref(event_context)
+            )?
+        };
+        Ok(())
+    }
+
+    /// Set the master volume level in decibels of the stream associated with the endpoint.
+    pub fn set_master_volume_level(
+        &self,
+        level_db: f32,
+        event_context: Option<&GUID>
+    ) -> WasapiRes<()> {
+        unsafe {
+            self.volume.SetMasterVolumeLevel(
+                level_db,
+                Self::ptr_from_ref(event_context)
+            )?
+        };
+        Ok(())
+    }
+
+    /// Set the normalized, audio-tapered master volume level of the stream associated with the endpoint.
+    pub fn set_master_volume_level_scalar(
+        &self,
+        level: f32,
+        event_context: Option<&GUID>
+    ) -> WasapiRes<()> {
+        unsafe {
+            self.volume.SetMasterVolumeLevelScalar(
+                level,
+                Self::ptr_from_ref(event_context)
+            )?
+        };
+        Ok(())
+    }
+
+    /// Set the mute state of the stream associated with the endpoint.
+    pub fn set_mute(&self, mute: bool, event_context: Option<&GUID>) -> WasapiRes<()> {
+        unsafe { self.volume.SetMute(mute, Self::ptr_from_ref(event_context))? };
+        Ok(())
+    }
+
+    /// Register a client's volume notification callback.
+    pub fn register_change_control_notify(
+        &self,
+        callback: Weak<AudioVolumeNotificationCallback>
+    ) -> WasapiRes<()> {
+        // TODO: how should we implement unregister??
+        let callback: IAudioEndpointVolumeCallback =
+            AudioEndpointVolumeCallback::new(callback).into();
+        match unsafe { self.volume.RegisterControlChangeNotify(&callback) } {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                Err(WasapiError::new(
+                    &format!("Failed to register audio volume notification, {}", err)
+                ).into())
+            }
+        }
+    }
+
+    /// Decrement by one step the volume level of the stream associated with the endpoint.
+    pub fn volume_step_down(&self, event_context: Option<&GUID>) -> WasapiRes<()> {
+        unsafe { self.volume.VolumeStepDown(Self::ptr_from_ref(event_context))? };
+        Ok(())
+    }
+
+    /// Increment by one step the volume level of the stream associated with the endpoint.
+    pub fn volume_step_up(&self, event_context: Option<&GUID>) -> WasapiRes<()> {
+        unsafe { self.volume.VolumeStepUp(Self::ptr_from_ref(event_context))? };
+        Ok(())
+    }
+}
 
 /// Struct wrapping an [IAudioClock](https://docs.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudioclock).
 pub struct AudioClock {
