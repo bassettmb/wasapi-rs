@@ -10,7 +10,9 @@ use windows::{
         DisconnectReasonExclusiveModeOverride, DisconnectReasonFormatChanged,
         DisconnectReasonServerShutdown, DisconnectReasonSessionDisconnected,
         DisconnectReasonSessionLogoff, IAudioSessionEvents, IAudioSessionEvents_Impl,
+        AUDIO_VOLUME_NOTIFICATION_DATA
     },
+    Win32::Media::Audio::Endpoints::{IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl}
 };
 
 use crate::SessionState;
@@ -285,6 +287,57 @@ impl IAudioSessionEvents_Impl for AudioSessionEvents {
                 let grouping = unsafe { *newgroupingparam };
                 callback(grouping, context);
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct AudioVolumeNotification<'a> {
+    pub event_context: GUID,
+    pub muted: bool,
+    pub master_volume: f32,
+    pub nchannels: u32,
+    pub channel_volumes: &'a [f32]
+}
+impl<'a> From<&'a AUDIO_VOLUME_NOTIFICATION_DATA> for AudioVolumeNotification<'a> {
+    fn from(data: &'a AUDIO_VOLUME_NOTIFICATION_DATA) -> Self {
+        Self {
+            event_context: data.guidEventContext,
+            muted: bool::from(data.bMuted),
+            master_volume: data.fMasterVolume,
+            nchannels: data.nChannels,
+            channel_volumes: {
+                let len = usize::try_from(data.nChannels).unwrap();
+                let ptr = &data.afChannelVolumes as *const f32;
+                unsafe {std::slice::from_raw_parts(ptr, len)}
+            }
+        }
+    }
+}
+
+pub struct AudioVolumeNotificationCallback(Box<dyn Fn(AudioVolumeNotification)>);
+impl AudioVolumeNotificationCallback {
+    pub fn new(callback: impl Fn(AudioVolumeNotification) + 'static) -> Self {
+        Self(Box::new(callback))
+    }
+}
+
+#[implement(IAudioEndpointVolumeCallback)]
+pub(crate) struct AudioEndpointVolumeCallback {
+    callback: Weak<AudioVolumeNotificationCallback>,
+}
+impl AudioEndpointVolumeCallback {
+    pub fn new(callback : Weak<AudioVolumeNotificationCallback>) -> Self {
+        AudioEndpointVolumeCallback { callback }
+    }
+}
+impl IAudioEndpointVolumeCallback_Impl for AudioEndpointVolumeCallback {
+    fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
+        if let Some(callback) = &mut self.callback.upgrade() {
+            let data = unsafe { data.as_ref() }.expect("non-null pointer");
+            let AudioVolumeNotificationCallback(callback) = &**callback;
+            callback(AudioVolumeNotification::from(data));
         }
         Ok(())
     }
